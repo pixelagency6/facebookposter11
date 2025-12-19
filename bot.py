@@ -1,4 +1,5 @@
 import os
+import sys
 import logging
 import asyncio
 import requests
@@ -6,7 +7,18 @@ import math
 from pyrogram import Client, filters, errors
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 from aiohttp import web
-# --- THE FIX IS HERE: Updated import for MoviePy v2+ ---
+
+# --- FFmpeg Fix for Render.com ---
+# This forces MoviePy to use the ffmpeg binary installed by python
+try:
+    import imageio_ffmpeg
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    os.environ["FFMPEG_BINARY"] = ffmpeg_path
+    print(f"✅ Forced FFmpeg path to: {ffmpeg_path}")
+except ImportError:
+    print("❌ Critical: imageio-ffmpeg not found")
+
+# Now it is safe to import MoviePy
 from moviepy import VideoFileClip
 
 # --- Configuration ---
@@ -18,14 +30,16 @@ FACEBOOK_PAGE_ACCESS_TOKEN = os.environ.get("FB_TOKEN", "").strip()
 FACEBOOK_PAGE_ID = os.environ.get("FB_PAGE_ID", "").strip()
 
 # --- Setup Logging ---
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # --- Pyrogram Bot Client ---
 app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # --- In-Memory State Management ---
-# Stores user progress: { chat_id: { 'mode': 'bulk'|'custom'|'split', 'step': 'title'|'desc'|'video', 'data': {} } }
 user_states = {}
 
 def upload_to_facebook(video_path, description, title=None):
@@ -66,11 +80,20 @@ def upload_to_facebook(video_path, description, title=None):
 def split_and_upload_sync(video_path, chat_id, original_caption):
     """Splits video into 1-minute chunks and returns upload results"""
     results = []
+    main_clip = None
     
     try:
-        # Load the video using the new import
-        clip = VideoFileClip(video_path)
-        duration = clip.duration
+        # Load the video with better error handling
+        logger.info(f"Attempting to load video: {video_path}")
+        main_clip = VideoFileClip(video_path)
+        
+        if main_clip is None:
+            return [{'error': {'message': 'Failed to load video file'}, 'is_fatal': True}]
+            
+        duration = main_clip.duration
+        
+        if duration <= 0:
+            return [{'error': {'message': 'Video has 0 duration, cannot split'}, 'is_fatal': True}]
         
         # Calculate number of 1-minute parts
         chunk_duration = 60 # seconds
@@ -80,51 +103,82 @@ def split_and_upload_sync(video_path, chat_id, original_caption):
         
         for i in range(total_parts):
             start_time = i * chunk_duration
-            # FIX: Ensure end_time doesn't exceed video duration
             end_time = min((i + 1) * chunk_duration, duration)
             
+            # Skip if start_time >= end_time (for very short videos)
+            if start_time >= end_time:
+                logger.warning(f"Skipping part {i+1}: start_time {start_time} >= end_time {end_time}")
+                continue
+                
             part_filename = f"part_{i+1}_{os.path.basename(video_path)}"
+            new_clip = None
             
             try:
-                # FIX: Use the correct method for MoviePy v2.0+ - subclipped() instead of subclip()
-                new_clip = clip.subclipped(start_time, end_time)
+                logger.info(f"Creating part {i+1}: {start_time}s to {end_time}s")
+                # Use subclipped (MoviePy v2.x syntax)
+                new_clip = main_clip.subclipped(start_time, end_time)
                 
-                # Write to file (using ultrafast preset to save CPU on Render)
+                if new_clip is None:
+                    raise ValueError(f"Failed to create subclip for part {i+1}")
+                
+                # Write with explicit FFmpeg parameters to reduce errors
+                logger.info(f"Writing part {i+1} to {part_filename}")
                 new_clip.write_videofile(
                     part_filename, 
                     codec="libx264", 
                     audio_codec="aac", 
                     preset="ultrafast",
                     threads=4,
-                    logger=None # Silence moviepy logs
+                    logger=None,
+                    ffmpeg_params=['-loglevel', 'warning']  # Reduce FFmpeg output
                 )
                 
-                # FIX: Close the subclip to free resources immediately
+                # Close immediately to free resources
                 new_clip.close()
+                new_clip = None
                 
                 # Upload this part
                 part_title = f"Part {i+1} of {total_parts}"
                 part_desc = f"{original_caption}\n\n(Part {i+1}/{total_parts})"
                 
+                logger.info(f"Uploading part {i+1} to Facebook")
                 upload_res = upload_to_facebook(part_filename, part_desc, part_title)
                 results.append(upload_res)
                 
-            except OSError as e:
-                # FIX: Catch and report subclipping/writing errors specifically
-                logger.error(f"Failed to process part {i+1}: {e}")
-                results.append({'error': {'message': f"Failed to process part {i+1}: {str(e)}"}, 'is_fatal': False})
+                # Log success
+                if 'id' in upload_res:
+                    logger.info(f"✅ Part {i+1} uploaded successfully: {upload_res['id']}")
+                else:
+                    logger.error(f"❌ Part {i+1} upload failed: {upload_res.get('error', {})}")
+                
+            except Exception as part_error:
+                logger.error(f"Failed to process part {i+1}: {part_error}", exc_info=True)
+                results.append({
+                    'error': {'message': f"Failed to process part {i+1}: {str(part_error)}"}, 
+                    'is_fatal': False
+                })
             finally:
+                # Cleanup part clip if still open
+                if new_clip is not None:
+                    try: new_clip.close()
+                    except: pass
+                
                 # Cleanup part file
                 if os.path.exists(part_filename):
-                    os.remove(part_filename)
+                    try: os.remove(part_filename)
+                    except Exception as e: logger.warning(f"Could not delete {part_filename}: {e}")
                     
-        # Close the main clip
-        clip.close()
         return results
 
     except Exception as e:
-        logger.error(f"Splitting Error: {e}")
+        logger.error(f"Splitting Error: {e}", exc_info=True)
         return [{'error': {'message': f"Split Failed: {str(e)}"}, 'is_fatal': True}]
+    
+    finally:
+        # Always close the main clip
+        if main_clip is not None:
+            try: main_clip.close()
+            except: pass
 
 # --- Handlers ---
 
