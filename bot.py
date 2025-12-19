@@ -80,34 +80,45 @@ def split_and_upload_sync(video_path, chat_id, original_caption):
         
         for i in range(total_parts):
             start_time = i * chunk_duration
+            # FIX: Ensure end_time doesn't exceed video duration
             end_time = min((i + 1) * chunk_duration, duration)
             
             part_filename = f"part_{i+1}_{os.path.basename(video_path)}"
             
-            # Create subclip
-            new_clip = clip.subclip(start_time, end_time)
-            
-            # Write to file (using ultrafast preset to save CPU on Render)
-            new_clip.write_videofile(
-                part_filename, 
-                codec="libx264", 
-                audio_codec="aac", 
-                preset="ultrafast",
-                threads=4,
-                logger=None # Silence moviepy logs
-            )
-            
-            # Upload this part
-            part_title = f"Part {i+1} of {total_parts}"
-            part_desc = f"{original_caption}\n\n(Part {i+1}/{total_parts})"
-            
-            upload_res = upload_to_facebook(part_filename, part_desc, part_title)
-            results.append(upload_res)
-            
-            # Cleanup part file
-            if os.path.exists(part_filename):
-                os.remove(part_filename)
+            try:
+                # FIX: Use the correct method for MoviePy v2.0+ - subclipped() instead of subclip()
+                new_clip = clip.subclipped(start_time, end_time)
                 
+                # Write to file (using ultrafast preset to save CPU on Render)
+                new_clip.write_videofile(
+                    part_filename, 
+                    codec="libx264", 
+                    audio_codec="aac", 
+                    preset="ultrafast",
+                    threads=4,
+                    logger=None # Silence moviepy logs
+                )
+                
+                # FIX: Close the subclip to free resources immediately
+                new_clip.close()
+                
+                # Upload this part
+                part_title = f"Part {i+1} of {total_parts}"
+                part_desc = f"{original_caption}\n\n(Part {i+1}/{total_parts})"
+                
+                upload_res = upload_to_facebook(part_filename, part_desc, part_title)
+                results.append(upload_res)
+                
+            except OSError as e:
+                # FIX: Catch and report subclipping/writing errors specifically
+                logger.error(f"Failed to process part {i+1}: {e}")
+                results.append({'error': {'message': f"Failed to process part {i+1}: {str(e)}"}, 'is_fatal': False})
+            finally:
+                # Cleanup part file
+                if os.path.exists(part_filename):
+                    os.remove(part_filename)
+                    
+        # Close the main clip
         clip.close()
         return results
 
