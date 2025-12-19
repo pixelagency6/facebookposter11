@@ -6,8 +6,8 @@ import math
 from pyrogram import Client, filters, errors
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 from aiohttp import web
-# --- THE FIX IS HERE: We import from 'editor' to get the splitting tools ---
-from moviepy.editor import VideoFileClip
+# --- THE FIX IS HERE: Updated import for MoviePy v2+ ---
+from moviepy import VideoFileClip
 
 # --- Configuration ---
 API_ID_RAW = os.environ.get("API_ID", "12345").strip()
@@ -68,7 +68,7 @@ def split_and_upload_sync(video_path, chat_id, original_caption):
     results = []
     
     try:
-        # Load the video using the full editor (requires moviepy.editor import)
+        # Load the video using the new import
         clip = VideoFileClip(video_path)
         duration = clip.duration
         
