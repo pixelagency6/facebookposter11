@@ -433,9 +433,12 @@ async def health_check(request):
     return web.Response(text="Running", status=200)
 
 async def start_web_server():
-    app_runner = web.AppRunner(web.Application())
+    web_app = web.Application()
+    web_app.add_routes([web.get('/', health_check)])
+    
+    app_runner = web.AppRunner(web_app)
     await app_runner.setup()
-    app_runner.app.add_routes([web.get('/', health_check)])
+    
     site = web.TCPSite(app_runner, "0.0.0.0", CONFIG.PORT)
     await site.start()
     logger.info(f"Web server started on port {CONFIG.PORT}")
