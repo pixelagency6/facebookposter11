@@ -1,355 +1,452 @@
 import os
 import sys
+import math
 import logging
 import asyncio
+import subprocess
+import shutil
+import time
+from typing import Dict, Optional, List, Union, Any
+from dataclasses import dataclass, field
+from enum import Enum
+
+import imageio_ffmpeg
 import requests
-import math
-from pyrogram import Client, filters, errors
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 from aiohttp import web
+from pyrogram import Client, filters
+from pyrogram.types import (
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton, 
+    Message, 
+    CallbackQuery
+)
 
-# --- FFmpeg Fix for Render.com ---
-# This forces MoviePy to use the ffmpeg binary installed by python
-try:
-    import imageio_ffmpeg
-    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-    os.environ["FFMPEG_BINARY"] = ffmpeg_path
-    print(f"✅ Forced FFmpeg path to: {ffmpeg_path}")
-except ImportError:
-    print("❌ Critical: imageio-ffmpeg not found")
+# --- Configuration & Environment ---
 
-# Now it is safe to import MoviePy
-from moviepy import VideoFileClip
+@dataclass
+class Config:
+    """Centralized configuration management."""
+    API_ID: int
+    API_HASH: str
+    BOT_TOKEN: str
+    FB_PAGE_TOKEN: str
+    FB_PAGE_ID: str
+    PORT: int = 8080
+    FFMPEG_BIN: str = "ffmpeg"
 
-# --- Configuration ---
-API_ID_RAW = os.environ.get("API_ID", "12345").strip()
-API_ID = int(API_ID_RAW) if API_ID_RAW.isdigit() else 12345
-API_HASH = os.environ.get("API_HASH", "").strip()
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-FACEBOOK_PAGE_ACCESS_TOKEN = os.environ.get("FB_TOKEN", "").strip()
-FACEBOOK_PAGE_ID = os.environ.get("FB_PAGE_ID", "").strip()
+    @classmethod
+    def load(cls) -> "Config":
+        """Loads and validates environment variables."""
+        # Setup FFmpeg path for Render.com or local
+        ffmpeg_bin = os.getenv("FFMPEG_BINARY")
+        if not ffmpeg_bin:
+            # Fallback to imageio's binary if system ffmpeg is missing
+            try:
+                ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception:
+                ffmpeg_bin = "ffmpeg"
+        
+        # Validate critical vars
+        try:
+            return cls(
+                API_ID=int(os.getenv("API_ID", "0")),
+                API_HASH=os.getenv("API_HASH", ""),
+                BOT_TOKEN=os.getenv("BOT_TOKEN", ""),
+                FB_PAGE_TOKEN=os.getenv("FB_TOKEN", ""),
+                FB_PAGE_ID=os.getenv("FB_PAGE_ID", ""),
+                PORT=int(os.getenv("PORT", "8080")),
+                FFMPEG_BIN=ffmpeg_bin
+            )
+        except ValueError as e:
+            logging.critical(f"Configuration Error: {e}")
+            sys.exit(1)
 
-# --- Setup Logging ---
+# Initialize Config
+CONFIG = Config.load()
+
+# --- Logging Setup ---
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("BotCore")
 
-# --- Pyrogram Bot Client ---
-app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# --- Constants & Enums ---
+class UploadMode(Enum):
+    BULK = "bulk"
+    CUSTOM = "custom"
+    SPLIT = "split"
 
-# --- In-Memory State Management ---
-user_states = {}
+class Step(Enum):
+    WAITING_TITLE = "title"
+    WAITING_DESC = "desc"
+    WAITING_VIDEO = "video"
+    IDLE = "idle"
 
-def upload_to_facebook(video_path, description, title=None):
-    """Uploads a video file to Facebook Graph API"""
-    url = f"https://graph-video.facebook.com/v18.0/{FACEBOOK_PAGE_ID}/videos"
+@dataclass
+class UserState:
+    mode: UploadMode = UploadMode.BULK
+    step: Step = Step.WAITING_VIDEO
+    meta_data: Dict[str, Any] = field(default_factory=dict)
+
+# --- State Management ---
+class StateManager:
+    """
+    Abstracts state management. 
+    Currently in-memory, but designed to be easily swapped for Redis.
+    """
+    def __init__(self):
+        self._db: Dict[int, UserState] = {}
+
+    def get(self, user_id: int) -> UserState:
+        if user_id not in self._db:
+            self._db[user_id] = UserState()
+        return self._db[user_id]
+
+    def update(self, user_id: int, **kwargs):
+        state = self.get(user_id)
+        for key, value in kwargs.items():
+            if hasattr(state, key):
+                setattr(state, key, value)
+
+state_manager = StateManager()
+
+# --- Services ---
+
+class VideoProcessor:
+    """Handles video manipulation using direct FFmpeg subprocess calls."""
     
-    logger.info(f"Attempting upload to Page ID: {FACEBOOK_PAGE_ID}")
-
-    payload = {
-        'access_token': FACEBOOK_PAGE_ACCESS_TOKEN,
-        'description': description or "Uploaded via Telegram Bot"
-    }
-    
-    if title:
-        payload['title'] = title
-
-    try:
-        if not os.path.exists(video_path):
-             return {'error': {'message': 'File not found locally'}}
-
-        with open(video_path, 'rb') as file:
-            files = {'source': file}
-            logger.info(f"Sending video data to Facebook... ({os.path.basename(video_path)})")
-            response = requests.post(url, data=payload, files=files)
-            
-            try:
-                response_data = response.json()
-                logger.info(f"Facebook API Response: {response_data}")
-                return response_data
-            except ValueError:
-                logger.error(f"Facebook returned non-JSON response: {response.text}")
-                return {'error': {'message': f"Facebook API Error: {response.status_code}"}}
-
-    except Exception as e:
-        logger.error(f"Upload function error: {e}")
-        return {'error': {'message': str(e)}}
-
-def split_and_upload_sync(video_path, chat_id, original_caption):
-    """Splits video into 1-minute chunks and returns upload results"""
-    results = []
-    main_clip = None
-    
-    try:
-        # Load the video with better error handling
-        logger.info(f"Attempting to load video: {video_path}")
-        main_clip = VideoFileClip(video_path)
+    @staticmethod
+    def get_duration(input_path: str) -> float:
+        """Get video duration using ffprobe."""
+        cmd = [
+            CONFIG.FFMPEG_BIN, "-i", input_path, "-hide_banner"
+        ]
+        # FFmpeg outputs duration to stderr
+        result = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True)
         
-        if main_clip is None:
-            return [{'error': {'message': 'Failed to load video file'}, 'is_fatal': True}]
-            
-        duration = main_clip.duration
-        
+        # Parse output for "Duration: 00:00:00.00"
+        try:
+            import re
+            match = re.search(r"Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})", result.stderr)
+            if match:
+                hours, mins, secs = map(float, match.groups())
+                return hours * 3600 + mins * 60 + secs
+        except Exception as e:
+            logger.error(f"Failed to parse duration: {e}")
+        return 0.0
+
+    @staticmethod
+    def split_video(input_path: str, output_dir: str, chunk_length: int = 60) -> List[str]:
+        """
+        Splits video into chunks using FFmpeg stream copying (fast) or re-encoding.
+        Returns a list of generated file paths.
+        """
+        duration = VideoProcessor.get_duration(input_path)
         if duration <= 0:
-            return [{'error': {'message': 'Video has 0 duration, cannot split'}, 'is_fatal': True}]
+            raise ValueError("Could not determine video duration.")
+
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        generated_files = []
+        total_parts = math.ceil(duration / chunk_length)
         
-        # Calculate number of 1-minute parts
-        chunk_duration = 60 # seconds
-        total_parts = math.ceil(duration / chunk_duration)
+        # Segment muxer is much more stable and faster than loop-splitting
+        output_pattern = os.path.join(output_dir, "part_%03d.mp4")
         
-        logger.info(f"Video Duration: {duration}s. Splitting into {total_parts} parts.")
+        logger.info(f"Splitting video of {duration}s into {total_parts} parts via FFmpeg segment muxer.")
         
-        for i in range(total_parts):
-            start_time = i * chunk_duration
-            end_time = min((i + 1) * chunk_duration, duration)
+        # Command: Re-encode to ensure Facebook compatibility (aac/h264) but fast
+        cmd = [
+            CONFIG.FFMPEG_BIN,
+            "-i", input_path,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", # Good balance of speed/quality
+            "-c:a", "aac", "-b:a", "128k",
+            "-f", "segment",
+            "-segment_time", str(chunk_length),
+            "-reset_timestamps", "1",
+            output_pattern
+        ]
+
+        try:
+            subprocess.run(cmd, check=True, stderr=subprocess.PIPE)
             
-            # Skip if start_time >= end_time (for very short videos)
-            if start_time >= end_time:
-                logger.warning(f"Skipping part {i+1}: start_time {start_time} >= end_time {end_time}")
-                continue
-                
-            part_filename = f"part_{i+1}_{os.path.basename(video_path)}"
-            new_clip = None
-            
-            try:
-                logger.info(f"Creating part {i+1}: {start_time}s to {end_time}s")
-                # Use subclipped (MoviePy v2.x syntax)
-                new_clip = main_clip.subclipped(start_time, end_time)
-                
-                if new_clip is None:
-                    raise ValueError(f"Failed to create subclip for part {i+1}")
-                
-                # Write with explicit FFmpeg parameters to reduce errors
-                logger.info(f"Writing part {i+1} to {part_filename}")
-                new_clip.write_videofile(
-                    part_filename, 
-                    codec="libx264", 
-                    audio_codec="aac", 
-                    preset="ultrafast",
-                    threads=4,
-                    logger=None,
-                    ffmpeg_params=['-loglevel', 'warning']  # Reduce FFmpeg output
-                )
-                
-                # Close immediately to free resources
-                new_clip.close()
-                new_clip = None
-                
-                # Upload this part
-                part_title = f"Part {i+1} of {total_parts}"
-                part_desc = f"{original_caption}\n\n(Part {i+1}/{total_parts})"
-                
-                logger.info(f"Uploading part {i+1} to Facebook")
-                upload_res = upload_to_facebook(part_filename, part_desc, part_title)
-                results.append(upload_res)
-                
-                # Log success
-                if 'id' in upload_res:
-                    logger.info(f"✅ Part {i+1} uploaded successfully: {upload_res['id']}")
-                else:
-                    logger.error(f"❌ Part {i+1} upload failed: {upload_res.get('error', {})}")
-                
-            except Exception as part_error:
-                logger.error(f"Failed to process part {i+1}: {part_error}", exc_info=True)
-                results.append({
-                    'error': {'message': f"Failed to process part {i+1}: {str(part_error)}"}, 
-                    'is_fatal': False
-                })
-            finally:
-                # Cleanup part clip if still open
-                if new_clip is not None:
-                    try: new_clip.close()
-                    except: pass
-                
-                # Cleanup part file
-                if os.path.exists(part_filename):
-                    try: os.remove(part_filename)
-                    except Exception as e: logger.warning(f"Could not delete {part_filename}: {e}")
+            # Gather generated files
+            for file in sorted(os.listdir(output_dir)):
+                if file.startswith("part_") and file.endswith(".mp4"):
+                    generated_files.append(os.path.join(output_dir, file))
                     
-        return results
+            return generated_files
+        except subprocess.CalledProcessError as e:
+            logger.error(f"FFmpeg Error: {e.stderr.decode()}")
+            raise RuntimeError("FFmpeg processing failed.")
+
+class FacebookService:
+    """Handles interactions with Facebook Graph API."""
+    
+    BASE_URL = "https://graph-video.facebook.com/v18.0"
+
+    @staticmethod
+    def upload_video(video_path: str, description: str, title: Optional[str] = None) -> Dict:
+        if not os.path.exists(video_path):
+            return {'error': {'message': 'File not found locally'}}
+
+        url = f"{FacebookService.BASE_URL}/{CONFIG.FB_PAGE_ID}/videos"
+        
+        payload = {
+            'access_token': CONFIG.FB_PAGE_TOKEN,
+            'description': description
+        }
+        if title:
+            payload['title'] = title
+
+        # Getting file size for logging
+        file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+        logger.info(f"Uploading {os.path.basename(video_path)} ({file_size_mb:.2f} MB)...")
+
+        try:
+            with open(video_path, 'rb') as file:
+                files = {'source': file}
+                # Increased timeout for large files
+                response = requests.post(url, data=payload, files=files, timeout=300)
+                return response.json()
+        except Exception as e:
+            logger.error(f"Upload failed: {e}")
+            return {'error': {'message': str(e)}}
+
+# --- Async Workers ---
+
+async def process_split_and_upload(client: Client, message: Message, video_path: str, caption: str):
+    """Orchestrates the split and upload workflow."""
+    status_msg = await message.reply_text("✂️ **FFmpeg Engine:** Analyzing and splitting video...")
+    temp_dir = f"temp_{message.id}"
+    
+    try:
+        loop = asyncio.get_running_loop()
+        
+        # 1. Split Video (CPU Bound - run in executor)
+        video_parts = await loop.run_in_executor(
+            None, 
+            VideoProcessor.split_video, 
+            video_path, 
+            temp_dir
+        )
+        
+        if not video_parts:
+            await status_msg.edit_text("❌ Failed to split video.")
+            return
+
+        total_parts = len(video_parts)
+        await status_msg.edit_text(f"✅ Split into {total_parts} parts.\n🚀 Starting upload queue...")
+
+        # 2. Upload Parts (I/O Bound)
+        results = []
+        
+        # Semaphore prevents too many concurrent uploads (memory/bandwidth protection)
+        sem = asyncio.Semaphore(2) 
+
+        async def upload_worker(idx: int, path: str):
+            async with sem:
+                part_title = f"Part {idx}/{total_parts}"
+                part_desc = f"{caption}\n\n({part_title})"
+                
+                # Update UI periodically (optional, simplified here)
+                res = await loop.run_in_executor(
+                    None, 
+                    FacebookService.upload_video, 
+                    path, part_desc, part_title
+                )
+                return (idx, res)
+
+        tasks = [upload_worker(i+1, path) for i, path in enumerate(video_parts)]
+        upload_results = await asyncio.gather(*tasks)
+
+        # 3. Compile Report
+        success_count = 0
+        report_lines = []
+        
+        for idx, res in upload_results:
+            if 'id' in res:
+                success_count += 1
+                report_lines.append(f"✅ Part {idx}: [Link](https://fb.com/{res['id']})")
+            else:
+                err = res.get('error', {}).get('message', 'Unknown')
+                report_lines.append(f"❌ Part {idx}: {err}")
+
+        final_text = (
+            f"🏁 **Batch Complete**\n"
+            f"Success: {success_count}/{total_parts}\n\n" + 
+            "\n".join(report_lines)
+        )
+        
+        # Check text length limit
+        if len(final_text) > 4000:
+            final_text = final_text[:4000] + "... (truncated)"
+            
+        await status_msg.edit_text(final_text, disable_web_page_preview=True)
 
     except Exception as e:
-        logger.error(f"Splitting Error: {e}", exc_info=True)
-        return [{'error': {'message': f"Split Failed: {str(e)}"}, 'is_fatal': True}]
+        logger.error(f"Process Error: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Critical Error: {str(e)}")
     
     finally:
-        # Always close the main clip
-        if main_clip is not None:
-            try: main_clip.close()
-            except: pass
+        # Cleanup
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        if os.path.exists(video_path):
+            os.remove(video_path)
 
-# --- Handlers ---
+# --- Bot Client & Handlers ---
+
+app = Client("senior_bot", api_id=CONFIG.API_ID, api_hash=CONFIG.API_HASH, bot_token=CONFIG.BOT_TOKEN)
 
 @app.on_message(filters.command("start"))
-async def start_command(client, message: Message):
-    """Welcome message with Mode Selection"""
+async def start_handler(client, message: Message):
     user_name = message.from_user.first_name
     
-    # Set default state
-    user_states[message.chat.id] = {'mode': 'bulk', 'step': 'video', 'data': {}}
+    # Reset State
+    state_manager.update(
+        message.chat.id, 
+        mode=UploadMode.BULK, 
+        step=Step.WAITING_VIDEO, 
+        meta_data={}
+    )
 
-    welcome_text = (
+    text = (
         f"👋 **Hello {user_name}!**\n\n"
-        "**Choose an upload mode:**\n"
-        "🚀 **Bulk:** Uploads videos exactly as they are.\n"
-        "📝 **Custom:** You set the Title & Description first.\n"
-        "✂️ **Split:** Turns 1 long video into 1-minute clips."
+        "**Select Mode:**\n"
+        "🚀 **Bulk:** Immediate upload.\n"
+        "📝 **Custom:** Set Title/Desc manually.\n"
+        "✂️ **Split:** Auto-split long videos (1 min)."
     )
     
     buttons = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🚀 Bulk Upload", callback_data="mode_bulk"),
-            InlineKeyboardButton("📝 Custom Title", callback_data="mode_custom")
+            InlineKeyboardButton("🚀 Bulk", callback_data="set_mode_bulk"),
+            InlineKeyboardButton("📝 Custom", callback_data="set_mode_custom")
         ],
-        [
-            InlineKeyboardButton("✂️ Split (1 min clips)", callback_data="mode_split")
-        ]
+        [InlineKeyboardButton("✂️ Split Series", callback_data="set_mode_split")]
     ])
     
-    await message.reply_text(welcome_text, reply_markup=buttons)
+    await message.reply_text(text, reply_markup=buttons)
 
-@app.on_callback_query()
-async def handle_callbacks(client, callback_query: CallbackQuery):
-    """Handle button clicks"""
-    chat_id = callback_query.message.chat.id
-    data = callback_query.data
+@app.on_callback_query(filters.regex(r"^set_mode_"))
+async def mode_handler(client, callback: CallbackQuery):
+    mode_str = callback.data.split("_")[-1]
+    chat_id = callback.message.chat.id
     
-    if data == "mode_bulk":
-        user_states[chat_id] = {'mode': 'bulk', 'step': 'video', 'data': {}}
-        await callback_query.message.edit_text("🚀 **Bulk Mode**\nSend videos, I'll upload them as-is.")
+    new_mode = UploadMode(mode_str)
     
-    elif data == "mode_custom":
-        user_states[chat_id] = {'mode': 'custom', 'step': 'title', 'data': {}}
-        await callback_query.message.edit_text("📝 **Custom Mode**\nFirst, send me the **TITLE**.")
-
-    elif data == "mode_split":
-        user_states[chat_id] = {'mode': 'split', 'step': 'video', 'data': {}}
-        await callback_query.message.edit_text(
-            "✂️ **Split Mode**\n"
-            "Send a long video.\n"
-            "I will chop it into **1-minute parts** and upload them all."
-        )
+    if new_mode == UploadMode.CUSTOM:
+        state_manager.update(chat_id, mode=new_mode, step=Step.WAITING_TITLE)
+        msg = "📝 **Custom Mode Activated**\nPlease send the **TITLE** for your next video."
+    elif new_mode == UploadMode.SPLIT:
+        state_manager.update(chat_id, mode=new_mode, step=Step.WAITING_VIDEO)
+        msg = "✂️ **Split Mode Activated**\nSend a long video, I will slice it."
+    else:
+        state_manager.update(chat_id, mode=new_mode, step=Step.WAITING_VIDEO)
+        msg = "🚀 **Bulk Mode Activated**\nSend videos to upload instantly."
+        
+    await callback.message.edit_text(msg)
 
 @app.on_message(filters.text & filters.private)
-async def handle_text(client, message: Message):
-    """Handle Title and Description inputs"""
-    chat_id = message.chat.id
-    state = user_states.get(chat_id)
-
-    if not state:
-        await start_command(client, message)
-        return
-
-    if state['mode'] == 'custom':
-        if state['step'] == 'title':
-            state['data']['title'] = message.text
-            state['step'] = 'desc'
-            await message.reply_text(f"✅ Title: **{message.text}**\nNow send the **DESCRIPTION**.")
-        
-        elif state['step'] == 'desc':
-            state['data']['desc'] = message.text
-            state['step'] = 'video'
-            await message.reply_text(f"✅ Description set.\n🎥 **Now send the VIDEO.**")
+async def text_handler(client, message: Message):
+    state = state_manager.get(message.chat.id)
+    
+    if state.mode == UploadMode.CUSTOM:
+        if state.step == Step.WAITING_TITLE:
+            state.meta_data['title'] = message.text
+            state.step = Step.WAITING_DESC
+            await message.reply_text("✅ Title saved. Now send the **DESCRIPTION**.")
+            
+        elif state.step == Step.WAITING_DESC:
+            state.meta_data['desc'] = message.text
+            state.step = Step.WAITING_VIDEO
+            await message.reply_text(f"✅ Description saved.\n🎥 **Send Video Now.**")
             
     else:
+        # Ignore random text in other modes
         pass
 
 @app.on_message(filters.video & filters.private)
-async def handle_video(client, message: Message):
+async def video_handler(client, message: Message):
     chat_id = message.chat.id
-    state = user_states.get(chat_id)
+    state = state_manager.get(chat_id)
     
-    if not state:
-        state = {'mode': 'bulk', 'step': 'video', 'data': {}}
-        user_states[chat_id] = state
-
-    # --- Mode Logic ---
-    if state['mode'] == 'custom' and state['step'] != 'video':
-        await message.reply_text("⚠️ Set Title/Description first! /start")
+    # Validation
+    if state.mode == UploadMode.CUSTOM and state.step != Step.WAITING_VIDEO:
+        await message.reply_text("⚠️ Please finish setting Title/Description first.")
         return
 
-    status_msg = await message.reply_text(f"📥 Downloading video...\nMode: **{state['mode'].title()}**")
-    
-    file_path = None
+    status_msg = await message.reply_text("📥 Downloading media...")
+    file_path = ""
+
     try:
         file_path = await message.download()
-        loop = asyncio.get_event_loop()
+        
+        if state.mode == UploadMode.SPLIT:
+            # Hand off to complex logic
+            caption = message.caption or "Series Upload"
+            await status_msg.delete()
+            await process_split_and_upload(client, message, file_path, caption)
+            return
 
-        if state['mode'] == 'split':
-            # --- SPLIT MODE ---
-            await status_msg.edit_text("✂️ Processing & Splitting video...\n(This might take a moment)")
-            
-            caption = message.caption if message.caption else "Part of a series"
-            
-            # Run split and upload in background
-            results = await loop.run_in_executor(None, split_and_upload_sync, file_path, chat_id, caption)
-            
-            # Generate Report
-            success_count = sum(1 for r in results if 'id' in r)
-            fail_count = len(results) - success_count
-            
-            report = f"🏁 **Job Done**\nUploaded: {success_count}\nFailed: {fail_count}\n\n"
-            for idx, res in enumerate(results):
-                if 'id' in res:
-                    report += f"✅ Part {idx+1}: Success\n"
-                else:
-                    err = res.get('error', {}).get('message', 'Error')
-                    report += f"❌ Part {idx+1}: {err}\n"
-            
-            await status_msg.reply_text(report)
-            await status_msg.delete() # Remove the "Processing" message
+        # Direct Upload Handling (Bulk or Custom)
+        await status_msg.edit_text("📤 Uploading to Facebook...")
+        
+        title = state.meta_data.get('title')
+        desc = state.meta_data.get('desc') or message.caption or "Uploaded via Bot"
+        
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, 
+            FacebookService.upload_video, 
+            file_path, desc, title
+        )
 
+        if 'id' in result:
+            await status_msg.edit_text(f"✅ **Published!**\nID: `{result['id']}`")
+            # Reset Custom mode to Bulk after success to prevent mistakes
+            if state.mode == UploadMode.CUSTOM:
+                state_manager.update(chat_id, mode=UploadMode.BULK, step=Step.WAITING_VIDEO, meta_data={})
+                await message.reply_text("🔄 Mode reset to Bulk.")
         else:
-            # --- BULK / CUSTOM MODE ---
-            await status_msg.edit_text("📤 Uploading to Facebook...")
-            
-            final_title = state['data'].get('title') if state['mode'] == 'custom' else None
-            final_desc = state['data'].get('desc') if state['mode'] == 'custom' else (message.caption or "")
-            
-            fb_response = await loop.run_in_executor(
-                None, upload_to_facebook, file_path, final_desc, final_title
-            )
-
-            if 'id' in fb_response:
-                success_text = f"✅ **Success!**\nPost ID: `{fb_response['id']}`"
-                if state['mode'] == 'custom':
-                     user_states[chat_id] = {'mode': 'bulk', 'step': 'video', 'data': {}}
-                     success_text += "\n\n(Mode reset to Bulk)"
-                await status_msg.edit_text(success_text)
-            else:
-                error_msg = fb_response.get('error', {}).get('message', 'Unknown error')
-                await status_msg.edit_text(f"❌ **Failed**\nFacebook Error: {error_msg}")
+            err = result.get('error', {}).get('message', 'Unknown API Error')
+            await status_msg.edit_text(f"❌ Upload Failed: {err}")
 
     except Exception as e:
-        logger.error(f"General Error: {e}")
-        try:
-            await status_msg.edit_text(f"❌ Error occurred: {str(e)}")
-        except:
-            pass
-    
+        logger.error(f"Handler Error: {e}", exc_info=True)
+        await status_msg.edit_text("❌ An internal error occurred.")
+        
     finally:
-        if file_path and os.path.exists(file_path):
+        # File cleanup for non-split modes (split mode cleans up itself)
+        if state.mode != UploadMode.SPLIT and file_path and os.path.exists(file_path):
             os.remove(file_path)
 
-# --- Dummy Web Server ---
+# --- Web Server (Health Check) ---
+
 async def health_check(request):
-    return web.Response(text="Bot is running!")
+    return web.Response(text="Running", status=200)
 
 async def start_web_server():
-    port = int(os.environ.get("PORT", 8080))
     app_runner = web.AppRunner(web.Application())
     await app_runner.setup()
-    bind_address = "0.0.0.0"
-    site = web.TCPSite(app_runner, bind_address, port)
+    app_runner.app.add_routes([web.get('/', health_check)])
+    site = web.TCPSite(app_runner, "0.0.0.0", CONFIG.PORT)
     await site.start()
+    logger.info(f"Web server started on port {CONFIG.PORT}")
+
+# --- Entry Point ---
 
 if __name__ == "__main__":
-    from pyrogram import idle
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(start_web_server())
-    app.start()
-    print("Bot is running...")
-    idle()
-    app.stop()
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(start_web_server())
+        logger.info("Bot starting...")
+        app.run()
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.critical(f"Fatal Startup Error: {e}")
