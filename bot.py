@@ -48,7 +48,7 @@ class Config:
         
         # Validate critical vars
         try:
-            return cls(
+            config = cls(
                 API_ID=int(os.getenv("API_ID", "0")),
                 API_HASH=os.getenv("API_HASH", ""),
                 BOT_TOKEN=os.getenv("BOT_TOKEN", ""),
@@ -57,6 +57,8 @@ class Config:
                 PORT=int(os.getenv("PORT", "8080")),
                 FFMPEG_BIN=ffmpeg_bin
             )
+            print(f"✅ Bot Config Loaded. FFmpeg path: {ffmpeg_bin}")
+            return config
         except ValueError as e:
             logging.critical(f"Configuration Error: {e}")
             sys.exit(1)
