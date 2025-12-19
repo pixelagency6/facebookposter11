@@ -1,6 +1,7 @@
-pyrogram
+pyrogram==2.0.106
 tgcrypto
-requests
-aiohttp
-moviepy
-imageio-ffmpeg
+requests==2.31.0
+aiohttp==3.9.1
+moviepy>=2.0.0
+imageio-ffmpeg>=0.4.2
+imageio>=2.34.0
