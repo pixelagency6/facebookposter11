@@ -2,11 +2,10 @@ import os
 import logging
 import asyncio
 import requests
-from pyrogram import Client, filters
+from pyrogram import Client, filters, errors
 from aiohttp import web
 
 # --- Configuration ---
-# Get these from your Environment Variables on Render
 API_ID = int(os.environ.get("API_ID", "12345")) 
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -30,43 +29,58 @@ def upload_to_facebook(video_path, caption):
     }
     
     # Open file and send
-    with open(video_path, 'rb') as file:
-        files = {'source': file}
-        logger.info("Starting upload to Facebook...")
-        response = requests.post(url, data=payload, files=files)
-    
-    return response.json()
+    try:
+        with open(video_path, 'rb') as file:
+            files = {'source': file}
+            logger.info("Starting upload to Facebook...")
+            response = requests.post(url, data=payload, files=files)
+            return response.json()
+    except Exception as e:
+        return {'error': {'message': str(e)}}
 
 @app.on_message(filters.video & filters.private)
 async def handle_video(client, message):
     status_msg = await message.reply_text("📥 Downloading video from Telegram...")
+    file_path = None
     
     try:
         # 1. Download Video from Telegram
         file_path = await message.download()
-        await status_msg.edit_text("📤 Uploading to Facebook...")
+        
+        try:
+            await status_msg.edit_text("📤 Uploading to Facebook...")
+        except errors.MessageNotModified:
+            pass # Ignore if text didn't change
 
-        # 2. Upload to Facebook (Run in a separate thread to not block async loop)
+        # 2. Upload to Facebook (Run in a separate thread)
         loop = asyncio.get_event_loop()
         caption = message.caption if message.caption else ""
         
-        # Using executor for blocking request
         fb_response = await loop.run_in_executor(None, upload_to_facebook, file_path, caption)
 
         # 3. Cleanup and Notify
         if 'id' in fb_response:
-            await status_msg.edit_text(f"✅ **Success!**\nVideo uploaded to Facebook.\nPost ID: `{fb_response['id']}`")
+            try:
+                await status_msg.edit_text(f"✅ **Success!**\nVideo uploaded to Facebook.\nPost ID: `{fb_response['id']}`")
+            except errors.MessageNotModified:
+                pass 
         else:
             error_msg = fb_response.get('error', {}).get('message', 'Unknown error')
-            await status_msg.edit_text(f"❌ **Failed**\nFacebook Error: {error_msg}")
+            try:
+                await status_msg.edit_text(f"❌ **Failed**\nFacebook Error: {error_msg}")
+            except errors.MessageNotModified:
+                pass
 
     except Exception as e:
         logger.error(f"Error: {e}")
-        await status_msg.edit_text(f"❌ Error occurred: {str(e)}")
+        try:
+            await status_msg.edit_text(f"❌ Error occurred: {str(e)}")
+        except:
+            pass
     
     finally:
         # Delete local file to save space
-        if os.path.exists(file_path):
+        if file_path and os.path.exists(file_path):
             os.remove(file_path)
 
 # --- Dummy Web Server for Render ---
@@ -74,7 +88,6 @@ async def health_check(request):
     return web.Response(text="Bot is running!")
 
 async def start_web_server():
-    # Render provides the PORT environment variable
     port = int(os.environ.get("PORT", 8080))
     app_runner = web.AppRunner(web.Application())
     await app_runner.setup()
@@ -83,21 +96,7 @@ async def start_web_server():
     await site.start()
 
 # --- Main Entry Point ---
-async def main():
-    # Start the Web Server (to keep Render happy)
-    await start_web_server()
-    
-    # Start the Bot
-    print("Bot started...")
-    await app.start()
-    
-    # Keep the script running
-    await pyrogram.idle()
-    await app.stop()
-
 if __name__ == "__main__":
-    # Pyrogram's idle() handles the loop, but we need to run both server and bot
-    # We use compose to run the bot and the web server together
     from pyrogram import idle
     
     loop = asyncio.get_event_loop()
